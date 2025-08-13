@@ -3,6 +3,16 @@
 # ParamStore  : SYSTEM.S3BUCKET.LZ, SYSTEM.S3BUCKET.DLZ
 # Dependencies : amorphicutils.zip
 # GlueVersion : 4.0
+
+# Update below variables in the script.
+# USERID : Amorphic UserId
+# W_DOMAIN :  Output Domain
+# W_DATASET :  Output DatasetName
+# INPUT_DATASET_MAPPING : 
+#           Dictionary of input Dataset mapping. 
+#           The keys are your table alias in your query (ex: dataset_name_1)
+# QUERY : Spark SQL Query. Note: Replace actual table names with alias
+
 ##########################################################################
 
 
@@ -37,21 +47,27 @@ dlz_bucket_name = ssm_client.get_parameter(
 
 
 # Update below (or parameterize as job args)
-userid = "harsha"
-w_domain = "demo"
-w_dataset = "s3_spark_out"
+USERID = "userid"
+W_DOMAIN = "output_domain"
+W_DATASET = "output_dataset"
 
 # Update below table mapping used in your query. DatasetNames are case-sensitive
-input_dataset_mapping = {
-    "immunization": {
-        "domain": "immunizationgold",
-        "dataset": "immunization",
+INPUT_DATASET_MAPPING = {
+    "dataset_name_1": {
+        "domain": "domain_1", 
+        "dataset": "DatasetName1",
     },
-    "immunization_clone": {
-        "domain": "immunizationbronze",
-        "dataset": "immunization_clone",
+    "dataset_name_2": {
+        "domain": "domain_2",
+        "dataset": "DatasetName2",
     },
 }
+# Define the SQL query
+QUERY = """
+    SELECT * FROM dataset_name_1
+    UNION ALL
+    SELECT * FROM dataset_name_2
+"""
 
 def read_data(input_mapping):
     """
@@ -90,12 +106,15 @@ def read_data(input_mapping):
     return df_dict
 
 
-def write_data(df, domain, dataset, user=userid, full_reload=False, **kwargs):
+def write_data(df, domain, dataset, user, full_reload=False, **kwargs):
     """
     Writes data to the Amorphic S3 using AmorphicUtils
 
     :param df: spark dataframe
-    :return:
+    :param domain: Output Domain name for the dataset
+    :param dataset: Output Dataset name
+    :param user: Amorphic User ID with write access to the dataset.
+    :return: Response dictionary containing exit codes,data and message.
     """
     epoch = str(int(time.time()))
     csv_writer = write.Write(lz_bucket_name, glue_context)
@@ -120,12 +139,13 @@ def write_data(df, domain, dataset, user=userid, full_reload=False, **kwargs):
     return response
 
 
-def create_view(query):
+def create_view(inp_df_dict,query):
     """
     Create a view from the input datasets.
+    :param inp_df_dict: Dictionary containing spark input dataframe.
+    :param query: SQL query to create the view.
+    :return: Spark DataFrame containing the result of the query.
     """
-    inp_df_dict = read_data(input_dataset_mapping)
-
     for dataset_name_key, dataset_data in inp_df_dict.items():
         dataset_data["data"].createOrReplaceTempView(dataset_name_key)
     spark_df = spark.sql(query)
@@ -136,23 +156,21 @@ def main():
     """
     Main function to execute the script.
     """
-    # Define the SQL query
-    query = """
-        SELECT * FROM immunization
-        UNION ALL
-        SELECT * FROM immunization_clone
-    """
+    LOGGER.info("Creating spark from Input Mapping")
+
+    input_df_dict = read_data(INPUT_DATASET_MAPPING)
+
     # Create the spark df using the SQL query
-    LOGGER.info("Creating spark df with query: {}".format(query))
-    spark_df = create_view(query=query)
+    LOGGER.info("Creating spark df with query: {}".format(QUERY))
+    spark_df = create_view(input_df_dict,query=QUERY)
     spark_df.show(20, truncate=False)
 
     # Write the result to the output dataset
     response = write_data(
         spark_df,
-        domain=w_domain,
-        dataset=w_dataset,
-        user=userid,
+        domain=W_DOMAIN,
+        dataset=W_DATASET,
+        user=USERID,
         full_reload=False,
     )
     print("Write Response: ", response)
