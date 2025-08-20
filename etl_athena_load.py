@@ -1,6 +1,17 @@
-# Script to run athena query and store the results to Dataset.
-# ParamStore  : SYSTEM.S3BUCKET.ATHENA, SYSTEM.S3BUCKET.LZ
-# Job Args  : userid, domain_name, dataset_name, w_domain, w_dataset
+##########################################################################
+# Description : Script to run athena query and store the results to Dataset..
+# ParamStore  : SYSTEM.S3BUCKET.LZ, SYSTEM.S3BUCKET.ATHENA
+# Dependencies : None
+# GlueVersion : 5.0
+
+# Update below variables in the script.
+# RESOURCE_ID : Amorphic Glue Job ID
+# USERID : Amorphic UserId
+# W_DOMAIN :  Output Domain
+# W_DATASET :  Output DatasetName
+# QUERY : Athena SQL Query.
+##########################################################################
+
 
 
 import sys
@@ -19,10 +30,10 @@ glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 
 ssm_client = boto3.client("ssm")
-athena_bucket_name = ssm_client.get_parameter(
+ATHENA_BUCKET_NAME = ssm_client.get_parameter(
     Name="SYSTEM.S3BUCKET.ATHENA", WithDecryption=False
 )["Parameter"]["Value"]
-lz_bucket_name = ssm_client.get_parameter(
+LZ_BUCKET_NAME = ssm_client.get_parameter(
     Name="SYSTEM.S3BUCKET.LZ", WithDecryption=False
 )["Parameter"]["Value"]
 
@@ -30,19 +41,18 @@ lz_bucket_name = ssm_client.get_parameter(
 athena_client = boto3.client("athena")
 
 # Update below (or parameterize as job args)
-userid = "harsha"
-domain_name = "mississippi_gold"
-w_domain = "demo"
-w_dataset = "s3_athena_out"
+RESOURCE_ID = "amorphic_job_id" # Job Id
+USERID = "userid"
+W_DOMAIN = "output_domain"
+W_DATASET = "output_dataset""
 
 # Athena query details
-query = f"select * from mississippi_gold.immunization LIMIT 10;"
-output_s3_path = f"s3://{athena_bucket_name}/{userid}"
+QUERY = f"select * from domain.dataset LIMIT 10;"
+output_s3_path = f"s3://{ATHENA_BUCKET_NAME}/glue-etl/{RESOURCE_ID}"
 
 # Start Athena query execution
 response = athena_client.start_query_execution(
-    QueryString=query,
-    QueryExecutionContext={"Database": domain_name},
+    QueryString=QUERY,
     ResultConfiguration={"OutputLocation": output_s3_path},
 )
 
@@ -63,7 +73,7 @@ while state in ["QUEUED", "RUNNING"]:
 # If the query succeeded, read the result from the S3 output location
 if state == "SUCCEEDED":
     # Fetch the result file path
-    result_file_path = f"{output_s3_path}{query_execution_id}.csv"
+    result_file_path = f"{output_s3_path}/{query_execution_id}.csv"
 
     # Read the result into a Spark DataFrame
     athena_df = spark.read.csv(result_file_path, header=True)
@@ -71,13 +81,18 @@ if state == "SUCCEEDED":
     # Show the result
     athena_df.show()
 
+    # Write to Dataset
+    upload_date = str(int(time.time()))
+    prefix = f"{W_DOMAIN}/{W_DATASET}/upload_date={upload_date}/{USERID}/csv/"
+    athena_df.write.csv(f"s3://{LZ_BUCKET_NAME}/{prefix}", header=True)
+
+    # To reload Dataset use below. To Append uncomment below
+    # df_success = pd.DataFrame([])
+    # df_success.to_csv(f"s3://{lz_bucket_name}/{prefix}_SUCCESS")
+
 else:
-    print(f"Athena query failed with state: {state}")
+    print(f"Athena query with id {query_execution_id} failed with state: {state}")
+    error_reason = query_status['QueryExecution']['Status']['StateChangeReason']
+    print(f"Reason for state {state} : {error_reason}")
+    raise Exception(error_reason)
 
-upload_date = str(int(time.time()))
-prefix = f"{w_domain}/{w_dataset}/upload_date={upload_date}/{userid}/csv/"
-athena_df.write.csv(f"s3://{lz_bucket_name}/{prefix}", header=True)
-
-# To reload Dataset use below. To Append comment below
-# df_success = pd.Dataframe([])
-# df_success.to_csv(f"s3://{lz_bucket_name}/{prefix}_SUCCESS")
