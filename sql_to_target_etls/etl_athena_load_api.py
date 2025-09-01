@@ -2,24 +2,32 @@
 # Description : Script to run athena query from API and store the results to Dataset..
 # ParamStore  : SYSTEM.S3BUCKET.DLZ, SYSTEM.S3BUCKET.LZ, SYSTEM.S3BUCKET.API.URL,
 #               SYSTEM.ENVIRONMENT,SYSTEM.AWSREGION, <YOUR-PAT-NAME>
-# Dependencies : amorphicutils.zip, athena_query_executor
+# Dependencies : amorphicutils.zip (> v4.0), playground_query_executor.py
 # GlueVersion : 5.0
 
-# Job Arguments.
-# --log_lvl : Sets the logging verbosity for the job.
-#             Accepted values are DEBUG, INFO, WARNING, ERROR, or CRITICAL.
-# --user_id : Amorphic UserId
-# --pat_param_name : Name of the parameter in Parameter Store with PAT details.
-#                    Value stored should be in below format.
-#                    {
-# 	                    "psdev" : {
-# 	                        "pat" : "<USER_PAT>",
-#                           "role" : "<ROLE_ID>"
-# 	                        }
-#                    }
-# --output_dataset :  Output DatasetName. e.g. domain:dataset
-# --sql_dataset :  DatasetName where SQL is stored. e.g. sql_domain:sql_dataset
-# --read_sql_file_name : SQL file name to be read from S3. e.g. sample_data_query.txt
+# Job Arguments 
+#   Mandatory Arguments.
+#   --user_id : Amorphic UserId
+#   --pat_param_name : Name of the parameter in Parameter Store with PAT details.
+#                      Value stored should be in below format.
+#                      {
+#   	                    "<ENVIRONMENT>" : {
+#   	                        "pat" : "<USER_PAT>",
+#                             "role" : "<ROLE_ID>"
+#   	                        }
+#                      }
+#   --output_dataset :  Output DatasetName. e.g. domain:dataset
+#   --sql_dataset :  DatasetName where SQL is stored. e.g. sql_domain:sql_dataset
+#   --read_sql_file_name : SQL file name to be read from S3. e.g. sample_data_query.txt
+#
+#   Below are Optional Arguments
+#       --log_lvl : (Optional) Sets the logging verbosity for the job.
+#             Accepted values are DEBUG, INFO, WARNING, ERROR, or CRITICAL. Default 'INFO
+#       --work_group: primary or AmazonAthenaEngineV3
+#       --query_target_location: 'redshift' or 'athena'. Default 'athena'
+#       --assume_role: 'yes' uses User IAM role. Default 'no'
+#       --query_status_retry: No of times to retry before checking query status again. Default 20
+#       --query_status_retry_delay: Delay in seconds for each retry. Default 15
 ####################################################################################
 
 
@@ -34,18 +42,22 @@ from amorphicutils.pyspark import write
 from amorphicutils.api.apiwrapper import ApiWrapper
 from playground_query_executor import PlaygroundQueryExecutor
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "log_lvl"])
-# Configure Logging
-log_level_str = args.get("log_lvl", "INFO").upper()
-log_level = getattr(logging, log_level_str, logging.INFO)
-logging.basicConfig(level=log_level_str)
-LOGGER = logging.getLogger(__name__)
-LOGGER.setLevel(log_level)
 
 # Initialize GlueContext and SparkContext
 glue_spark = GlueSpark()
 glue_context = glue_spark.get_glue_context()
 spark = glue_spark.get_spark()
+
+# Configure Logging
+log_level_str = "INFO"
+if "--log_lvl" in sys.argv:
+    opt_args = getResolvedOptions(sys.argv, ["log_lvl"])
+    log_level_str = opt_args.get("log_lvl", "INFO").upper()
+
+log_level = getattr(logging, log_level_str, logging.INFO)
+logging.basicConfig(level=log_level_str)
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(log_level)
 
 athena_client = boto3.client("athena")
 ssm_client = boto3.client("ssm")
@@ -69,20 +81,17 @@ AMORPHIC_REGION = ssm_client.get_parameter(
 
 print(f"Region : {AMORPHIC_REGION}, Env: {AMORPHIC_ENV}")
 
-args = getResolvedOptions(
-    sys.argv, ["JOB_NAME", "user_id", "output_dataset", "pat_param_name"]
-)
+args = getResolvedOptions(sys.argv, ["user_id", "output_dataset", "pat_param_name"])
 AMORPHIC_PAT_DETAILS = ssm_client.get_parameter(
     Name=args["pat_param_name"], WithDecryption=True
 )["Parameter"]["Value"]
-auth_key = json.loads(AMORPHIC_PAT_DETAILS)[AMORPHIC_ENV]["pat"]
-role_id = json.loads(AMORPHIC_PAT_DETAILS)[AMORPHIC_ENV]["role"]
-
 
 USERID = args["user_id"]
 W_DOMAIN = args["output_dataset"].split(":")[0]
 W_DATASET = args["output_dataset"].split(":")[1]
 
+auth_key = json.loads(AMORPHIC_PAT_DETAILS)[AMORPHIC_ENV]["pat"]
+role_id = json.loads(AMORPHIC_PAT_DETAILS)[AMORPHIC_ENV]["role"]
 api = ApiWrapper(
     url=AMORPHIC_API_URL, env=AMORPHIC_ENV, auth_key=auth_key, role_id=role_id
 )
@@ -169,6 +178,11 @@ def execute_db_query(
     """
     Execute Athena Query and return the result as Spark DataFrame
     :param athena_query: SQL Query to be executed in Athena
+    :param work_group: primary or AmazonAthenaEngineV3
+    :param query_target_location: 'redshift' or 'athena'
+    :param assume_role: 'yes' uses User IAM role.
+    :param retry: No of times to retry before checking query status again.
+    :param delay: Delay in seconds for each retry.
     :return: Spark DataFrame containing the result of the query
     """
     LOGGER.info("In execute_db_query")
@@ -204,9 +218,30 @@ def main():
     sql_dataset_prefix = f"{sql_dataset.strip().replace(':','/')}/"
     print(f"SQL Dataset Prefix: {sql_dataset_prefix}")
 
+    optional_args = {
+        "work_group": "primary",
+        "query_target_location": "athena",
+        "assume_role": "no",
+        "query_status_retry": 20,
+        "query_status_retry_delay": 15,
+    }  # Retry Mins = 20 X 15 = 300s = 5 mins
+    for k, v in optional_args.items():
+        args[k] = (
+            getResolvedOptions(sys.argv, [k])[k]
+            if (f"--{k}" in sys.argv or k in sys.argv)
+            else v
+        )
+
     query = read_sql_file(DLZ_BUCKET_NAME, sql_dataset_prefix, read_sql_file_name)
     if query is not None:
-        athena_spark_df = execute_db_query(query)
+        athena_spark_df = execute_db_query(
+            query,
+            work_group=optional_args["work_group"],
+            query_target_location=optional_args["query_target_location"],
+            assume_role=optional_args["assume_role"],
+            retry=int(args["query_status_retry"]),
+            delay=int(args["query_status_retry_delay"]),
+        )
 
         if not athena_spark_df.rdd.isEmpty():
             # Show the result
